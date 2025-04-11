@@ -1,0 +1,452 @@
+// ==UserScript==
+// @name         ChatGPT对话Markdown导出
+// @name:en      ChatGPT to Markdown Exporter
+// @version      1.0
+// @description  导出ChatGPT和Grok网站上的对话为Markdown格式
+// @description:en  Export chat history from ChatGPT and Grok websites to Markdown format
+// @match        https://chatgpt.com/*
+// @match        https://*.openai.com/*
+// @match        https://grok.com/*
+// @grant        none
+// ==/UserScript==
+
+(function() {
+    'use strict';
+
+    /**
+     * Selects the appropriate conversation message elements based on the current website.
+     * @returns {NodeListOf<Element>} A NodeList of conversation elements.
+     */
+    function getConversationElements() {
+        const currentUrl = window.location.href;
+        // Selectors for ChatGPT/OpenAI
+        if (currentUrl.includes("openai.com") || currentUrl.includes("chatgpt.com")) {
+            // This selector targets the container holding both user prompt and AI response text areas.
+            // Note: This selector might need updates if OpenAI changes their site structure.
+            return document.querySelectorAll('div[data-message-author-role]'); // More robust selector potentially
+            // return document.querySelectorAll('div.flex.flex-grow.flex-col.max-w-full'); // Original selector
+        }
+        // Selectors for Grok
+        else if (currentUrl.includes("grok.com")) {
+            // Note: This selector might need updates if Grok changes their site structure.
+            return document.querySelectorAll('div.message-bubble');
+        }
+        return []; // Return empty NodeList if no match
+    }
+
+    /**
+     * Converts an HTML string fragment into Markdown format.
+     * @param {string} html - The HTML string to convert.
+     * @returns {string} The Markdown representation.
+     */
+    function htmlToMarkdown(html) {
+        if (!html) return ''; // Handle empty or null input
+
+        const parser = new DOMParser();
+        // Wrap the HTML in a temporary div to ensure proper parsing, especially for text nodes
+        const doc = parser.parseFromString(`<div>${html}</div>`, 'text/html');
+        const container = doc.body.firstChild; // Get the container div
+
+        if (!container) return ''; // Handle parsing errors
+
+        // 1. Handle LaTeX Math (KaTeX) - Replace specific elements with LaTeX delimiters
+        container.querySelectorAll('annotation[encoding="application/x-tex"]').forEach(element => {
+            const latex = element.textContent || '';
+            // Check if it's block display math (usually within .katex-display) or inline math
+            const isDisplay = element.closest('.katex-display') !== null;
+            // Replace the closest parent that represents the whole formula structure
+            const formulaContainer = element.closest('.katex');
+            if (formulaContainer) {
+                formulaContainer.replaceWith(isDisplay ? `\n$$\n${latex.trim()}\n$$\n` : `$${latex.trim()}$`);
+            } else {
+                // Fallback if .katex isn't found (might happen with simple inline)
+                 element.replaceWith(`$${latex.trim()}$`);
+            }
+        });
+        // Remove residual KaTeX helper elements if any remain after replacement
+        container.querySelectorAll('span.katex-html, mrow, math').forEach(el => el.remove());
+
+
+        // 2. Handle Code Blocks
+        container.querySelectorAll('pre').forEach(pre => {
+            // Attempt to find language identifier (often in a sibling/child element)
+            // This part is highly dependent on the specific HTML structure of the site.
+            let language = '';
+            const langElement = pre.querySelector('div:first-child > span, div:first-child'); // Example common locations
+            if (langElement) {
+                // Basic cleanup of common language tags like "python", "javascript" etc.
+                language = langElement.textContent?.trim().toLowerCase().split('\n')[0] || '';
+                // Filter out irrelevant keywords commonly found near language tags
+                const irrelevantKeywords = ['copy code', '复制代码', '收起', 'automatic line breaks', '自动换行'];
+                irrelevantKeywords.forEach(kw => language = language.replace(kw, '').trim());
+            }
+
+            // Find the actual code content, trying common structures
+            const codeElement = pre.querySelector('code');
+            const codeContent = codeElement ? codeElement.textContent || '' : pre.textContent || ''; // Fallback to pre's content
+
+            // Replace the <pre> element with Markdown code block syntax
+            pre.replaceWith(`\n\`\`\`${language}\n${codeContent.trim()}\n\`\`\`\n`);
+        });
+
+        // 3. Handle Basic Inline Formatting
+        container.querySelectorAll('strong, b').forEach(bold => bold.replaceWith(`**${bold.textContent || ''}**`));
+        container.querySelectorAll('em, i').forEach(italic => italic.replaceWith(`*${italic.textContent || ''}*`));
+        // Make sure to only target code tags *not* inside pre tags (already handled)
+        container.querySelectorAll(':not(pre) > code').forEach(code => code.replaceWith(`\`${code.textContent || ''}\``));
+
+        // 4. Handle Links
+        container.querySelectorAll('a').forEach(link => {
+            const text = link.textContent?.trim() || '';
+            const href = link.getAttribute('href') || '';
+            // Avoid empty links or links that are just placeholders
+            if (href && href !== '#' && text) {
+                link.replaceWith(`[${text}](${href})`);
+            } else if (text) {
+                // If link is invalid but has text, keep the text
+                link.replaceWith(text);
+            } else {
+                // If no text, remove the link
+                link.remove();
+            }
+        });
+
+        // 5. Handle Images
+        container.querySelectorAll('img').forEach(img => {
+            const alt = img.getAttribute('alt')?.trim() || 'image';
+            const src = img.getAttribute('src') || '';
+            if (src) {
+                img.replaceWith(`![${alt}](${src})`);
+            } else {
+                img.remove(); // Remove image if no source
+            }
+        });
+
+        // 6. Handle Lists (Unordered and Ordered)
+        container.querySelectorAll('ul').forEach(ul => {
+            let markdown = '\n';
+            ul.querySelectorAll(':scope > li').forEach(li => {
+                // Recursively process list item content for nested formatting
+                const liContent = htmlToMarkdown(li.innerHTML).trim();
+                markdown += `- ${liContent}\n`;
+            });
+            ul.replaceWith(markdown);
+        });
+
+        container.querySelectorAll('ol').forEach(ol => {
+            let markdown = '\n';
+            ol.querySelectorAll(':scope > li').forEach((li, index) => {
+                // Recursively process list item content
+                const liContent = htmlToMarkdown(li.innerHTML).trim();
+                markdown += `${index + 1}. ${liContent}\n`;
+            });
+            ol.replaceWith(markdown);
+        });
+
+        // 7. Handle Tables
+        container.querySelectorAll('table').forEach(table => {
+            let markdown = '\n';
+            // Header
+            const headers = table.querySelectorAll('thead th');
+            if (headers.length > 0) {
+                markdown += `| ${Array.from(headers).map(th => htmlToMarkdown(th.innerHTML).trim().replace(/\|/g, '\\|')).join(' | ')} |\n`;
+                markdown += `| ${Array.from(headers).map(() => '----').join(' | ')} |\n`;
+            }
+            // Body
+            table.querySelectorAll('tbody tr').forEach(tr => {
+                const cells = tr.querySelectorAll('td');
+                markdown += `| ${Array.from(cells).map(td => htmlToMarkdown(td.innerHTML).trim().replace(/\|/g, '\\|')).join(' | ')} |\n`;
+            });
+            table.replaceWith(markdown + '\n');
+        });
+
+
+        // 8. Handle Headings (H1-H6)
+        for (let i = 1; i <= 6; i++) {
+            container.querySelectorAll(`h${i}`).forEach(header => {
+                header.replaceWith(`\n${'#'.repeat(i)} ${header.textContent?.trim()}\n`);
+            });
+        }
+
+        // 9. Handle Paragraphs - Ensure proper spacing
+        container.querySelectorAll('p').forEach(p => {
+            // Convert paragraph content recursively and ensure it ends with two newlines for spacing
+            const pContent = htmlToMarkdown(p.innerHTML).trim();
+            if (pContent) { // Only add paragraphs with content
+                 p.replaceWith(pContent + '\n\n');
+            } else {
+                p.remove(); // Remove empty paragraphs
+            }
+        });
+
+        // 10. Final Cleanup: Get text content and perform text-based replacements
+        // Get the text content *after* HTML structure has been converted to Markdown text
+        let markdown = container.textContent || '';
+
+        // Consolidate whitespace and clean up artifacts
+        markdown = markdown
+            // Replace common HTML entities that might remain as text
+            .replace(/>/g, '>')
+            .replace(/</g, '<')
+            .replace(/&/g, '&')
+            .replace(/ /g, ' ')
+             // Math symbol cleanup (might be redundant if KaTeX handler works well)
+            .replace(/≥/g, '>=')
+            .replace(/≤/g, '<=')
+            .replace(/≠/g, '\\neq')
+            // Remove specific leftover keywords (adjust as needed)
+            .replace(/pythonCopy code/g, 'python') // Example specific cleanup
+            .replace(/Copy code|复制代码|收起|自动换行|Click to copy/g, '')
+            // Normalize newlines: replace triple+ newlines with two, double+ at start/end with one/none
+            .replace(/\n{3,}/g, '\n\n')
+            .replace(/^\n+/, '')
+            .replace(/\n+$/, '')
+            .trim(); // Final trim
+
+        return markdown;
+    }
+
+
+    /**
+     * Triggers a browser download for the given data.
+     * @param {string} data - The content to download.
+     * @param {string} filename - The desired filename.
+     * @param {string} type - The MIME type (e.g., 'text/markdown').
+     */
+    function download(data, filename, type) {
+        const file = new Blob([data], { type });
+        const a = document.createElement('a');
+        const url = URL.createObjectURL(file);
+        a.href = url;
+        a.download = filename;
+        document.body.appendChild(a);
+        a.click();
+        // Clean up the temporary elements and URL
+        setTimeout(() => {
+            document.body.removeChild(a);
+            window.URL.revokeObjectURL(url);
+        }, 0);
+    }
+
+    /**
+     * Extracts conversation, converts it to Markdown, and displays it in a modal.
+     */
+    function showExportModal() {
+        let markdownContent = "";
+        const allElements = getConversationElements();
+
+        // Determine site for specific processing logic
+        const isChatGPT = window.location.href.includes("openai.com") || window.location.href.includes("chatgpt.com");
+        const isGrok = window.location.href.includes("grok.com");
+
+        // --- Processing Logic ---
+        if (isChatGPT) {
+            // ChatGPT structure (using data-message-author-role)
+            allElements.forEach(element => {
+                 const role = element.getAttribute('data-message-author-role');
+                 const contentWrapper = element.querySelector('.markdown') || // Standard response
+                                       element.querySelector('div.relative.flex'); // Often contains user prompt text directly
+
+                 if (contentWrapper) {
+                     const contentHtml = contentWrapper.innerHTML;
+                     const contentMarkdown = htmlToMarkdown(contentHtml).trim();
+
+                     if (role === 'user') {
+                         markdownContent += `**User:**\n${contentMarkdown}\n\n`;
+                     } else if (role === 'assistant') {
+                         markdownContent += `**Assistant:**\n${contentMarkdown}\n\n`;
+                     } else {
+                         // Handle other roles or elements if necessary
+                          markdownContent += `**${role || 'Unknown Role'}:**\n${contentMarkdown}\n\n`;
+                     }
+                 }
+             });
+        } else if (isGrok) {
+             // Grok structure (assuming simple alternation or specific classes)
+             // Needs inspection of Grok's HTML structure for reliable role detection
+             // This is a placeholder assuming alternation might work for simple cases
+            for (let i = 0; i < allElements.length; i++) {
+                 const elementHtml = allElements[i].innerHTML;
+                 const contentMarkdown = htmlToMarkdown(elementHtml).trim();
+                 // VERY simplified assumption: Even index is user, odd is assistant
+                 // Replace this with actual role detection based on Grok's classes/attributes
+                 const role = (i % 2 === 0) ? "User" : "Assistant";
+                 markdownContent += `**${role}:**\n${contentMarkdown}\n\n`;
+             }
+        }
+        // --- End Processing Logic ---
+
+
+        if (!markdownContent.trim()) {
+            alert("No conversation content found or extracted.");
+            return;
+        }
+
+        // --- Modal UI Code ---
+        // Remove existing modal first if any
+        const existingModal = document.getElementById('markdown-export-modal');
+        if (existingModal) {
+            existingModal.remove();
+        }
+
+        const modal = document.createElement('div');
+        modal.id = 'markdown-export-modal'; // Unique ID
+        Object.assign(modal.style, {
+            position: 'fixed', top: '0', left: '0', width: '100%', height: '100%',
+            backgroundColor: 'rgba(0, 0, 0, 0.6)', display: 'flex',
+            alignItems: 'center', justifyContent: 'center', zIndex: '10001' // High z-index
+        });
+
+        const modalContent = document.createElement('div');
+        Object.assign(modalContent.style, {
+            backgroundColor: '#333', color: '#eee', padding: '25px', borderRadius: '8px',
+            width: '70%', height: '85%', display: 'flex', flexDirection: 'column',
+            boxShadow: '0 5px 15px rgba(0,0,0,0.3)', overflow: 'hidden'
+        });
+
+        const title = document.createElement('h2');
+        title.textContent = 'Exported Markdown';
+        Object.assign(title.style, { marginTop: '0', marginBottom: '15px', color: '#fff', borderBottom: '1px solid #555', paddingBottom: '10px'});
+
+        const textarea = document.createElement('textarea');
+        textarea.value = markdownContent.trim(); // Ensure final trim
+        Object.assign(textarea.style, {
+            flex: '1', resize: 'none', width: '100%', padding: '15px', fontSize: '14px',
+            fontFamily: 'monospace', marginBottom: '15px', boxSizing: 'border-box',
+            color: '#ddd', backgroundColor: '#222', border: '1px solid #555', borderRadius: '4px'
+        });
+        textarea.setAttribute('readonly', true);
+
+        const buttonContainer = document.createElement('div');
+        Object.assign(buttonContainer.style, { display: 'flex', justifyContent: 'flex-end', gap: '10px' }); // Use gap for spacing
+
+        // Button Styling Function
+        const createButton = (text, bgColor, hoverColor) => {
+            const button = document.createElement('button');
+            button.textContent = text;
+            Object.assign(button.style, {
+                padding: '10px 20px', fontSize: '14px', cursor: 'pointer',
+                backgroundColor: bgColor, color: '#fff', border: 'none', borderRadius: '4px',
+                transition: 'background-color 0.2s ease'
+            });
+            button.onmouseover = () => button.style.backgroundColor = hoverColor;
+            button.onmouseout = () => button.style.backgroundColor = bgColor;
+            return button;
+        };
+
+        const copyButton = createButton('Copy', '#4CAF50', '#45a049'); // Green
+        const downloadButton = createButton('Download', '#008CBA', '#007ba7'); // Blue
+        const closeButton = createButton('Close', '#f44336', '#e53935'); // Red
+
+        buttonContainer.appendChild(copyButton);
+        buttonContainer.appendChild(downloadButton);
+        buttonContainer.appendChild(closeButton);
+        modalContent.appendChild(title);
+        modalContent.appendChild(textarea);
+        modalContent.appendChild(buttonContainer);
+        modal.appendChild(modalContent);
+        document.body.appendChild(modal);
+
+        // --- Event Listeners ---
+        copyButton.addEventListener('click', () => {
+            textarea.select();
+            textarea.setSelectionRange(0, textarea.value.length); // For mobile friendliness
+            navigator.clipboard.writeText(textarea.value)
+                .then(() => {
+                    copyButton.textContent = 'Copied!';
+                    copyButton.style.backgroundColor = '#ff9800'; // Orange for success indication
+                    setTimeout(() => {
+                        copyButton.textContent = 'Copy';
+                        copyButton.style.backgroundColor = '#4CAF50'; // Revert color
+                    }, 2000);
+                })
+                .catch(err => {
+                    console.error('Markdown Exporter: Copy failed', err);
+                    alert('Failed to copy text.'); // Provide user feedback
+                });
+        });
+
+        downloadButton.addEventListener('click', () => {
+            // Generate filename (e.g., chatgpt-export-timestamp.md)
+            const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+            const filename = `${window.location.hostname}-export-${timestamp}.md`;
+            download(textarea.value, filename, 'text/markdown;charset=utf-8');
+        });
+
+        const closeModal = () => {
+             if (document.getElementById('markdown-export-modal')) {
+                 document.body.removeChild(modal);
+                 document.removeEventListener('keydown', escListener);
+             }
+        };
+
+        closeButton.addEventListener('click', closeModal);
+
+        // Close modal on Escape key
+        const escListener = (e) => {
+            if (e.key === 'Escape') {
+                closeModal();
+            }
+        };
+        document.addEventListener('keydown', escListener);
+
+        // Close modal on clicking background overlay
+        modal.addEventListener('click', (e) => {
+            if (e.target === modal) { // Check if the click is directly on the overlay
+                closeModal();
+            }
+        });
+        // --- End Modal UI & Listeners ---
+    }
+
+    /**
+     * Creates and adds the "Export Chat" button to the page.
+     */
+    function createExportButton() {
+        // Check if button already exists
+        if (document.getElementById('export-chat-markdown-button')) {
+            return;
+        }
+
+        const exportButton = document.createElement('button');
+        exportButton.textContent = 'Export MD'; // Shorter text
+        exportButton.id = 'export-chat-markdown-button'; // Unique ID
+        Object.assign(exportButton.style, {
+            position: 'fixed',
+            height: 'auto', // Auto height based on padding
+            bottom: '20px', // Position at bottom right
+            right: '20px',
+            zIndex: '10000',
+            padding: '8px 15px', // Adjust padding
+            backgroundColor: 'rgba(0, 0, 0, 0.7)', // Slightly transparent black
+            color: 'white',
+            border: '1px solid #555',
+            borderRadius: '5px',
+            cursor: 'pointer',
+            fontSize: '13px',
+            lineHeight: '1.2',
+            boxShadow: '0 2px 5px rgba(0,0,0,0.3)',
+            transition: 'background-color 0.2s ease'
+        });
+         exportButton.onmouseover = () => exportButton.style.backgroundColor = 'rgba(0, 0, 0, 0.9)';
+         exportButton.onmouseout = () => exportButton.style.backgroundColor = 'rgba(0, 0, 0, 0.7)';
+
+        document.body.appendChild(exportButton);
+        exportButton.addEventListener('click', showExportModal);
+    }
+
+    // --- Initialization ---
+    // Initial button creation attempt
+    // Use requestAnimationFrame to wait for page elements to likely be ready
+    requestAnimationFrame(createExportButton);
+
+    // Robustness: Check periodically if the button is gone (e.g., due to SPA navigation)
+    // and recreate it. Use a less frequent interval.
+    const ensureButtonInterval = setInterval(() => {
+        if (!document.getElementById('export-chat-markdown-button')) {
+             console.log("Markdown Exporter: Button not found, recreating.");
+            createExportButton();
+        }
+    }, 3000); // Check every 3 seconds
+
+})();
